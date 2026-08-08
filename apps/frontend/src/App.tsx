@@ -34,7 +34,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetchEvents({ limit: 500 })
+    fetchEvents({ limit: 1500 })
       .then((data) => { setEvents(data); setLoading(false); })
       .catch((e) => { setError(e.message); setLoading(false); });
   }, []);

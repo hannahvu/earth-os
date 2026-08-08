@@ -95,14 +95,23 @@ def upsert_events(events: List[EarthEvent], db_path: str) -> int:
 def get_events(
     db_path: str,
     region: Optional[str] = None,
+    event_type: Optional[str] = None,
     limit: int = 500,
 ) -> List[EarthEvent]:
-    """Query events, optionally filtered by region, ordered by observed_at desc."""
-    query = "SELECT * FROM events"
+    """Query events, optionally filtered by region and/or event_type, ordered by observed_at desc."""
+    filters = []
     params: list = []
+
     if region:
-        query += " WHERE region = ?"
+        filters.append("region = ?")
         params.append(region)
+    if event_type:
+        filters.append("event_type = ?")
+        params.append(event_type)
+
+    query = "SELECT * FROM events"
+    if filters:
+        query += " WHERE " + " AND ".join(filters)
     query += " ORDER BY observed_at DESC LIMIT ?"
     params.append(limit)
 

@@ -21,11 +21,12 @@ app.add_middleware(
 
 @app.get("/events", response_model=List[EarthEvent])
 def list_events(
-    region: Optional[str] = Query(None, description="Filter by BA code, e.g. ERCO"),
-    limit: int = Query(500, ge=1, le=5000, description="Max rows to return"),
+    region: Optional[str] = Query(None, description="Filter by region, e.g. ERCO"),
+    event_type: Optional[str] = Query(None, description="Filter by event type, e.g. earthquake, grid_demand"),
+    limit: int = Query(1500, ge=1, le=5000, description="Max rows to return"),
 ) -> List[EarthEvent]:
     db_path = os.environ.get("EARTHOS_DB", "earthos.db")
-    return get_events(db_path, region=region, limit=limit)
+    return get_events(db_path, region=region, event_type=event_type, limit=limit)
 
 
 @app.get("/health")
