@@ -1,0 +1,43 @@
+name: Hourly ingest
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # off the top of the hour, when GitHub delays scheduled runs most
+  workflow_dispatch:
+  # TEMP: scheduled and manual runs only work from the default branch (main).
+  # This lets us test on v0.03 first — remove before merging to main.
+  push:
+    branches: [v0.03]
+
+concurrency:
+  group: ingest
+  cancel-in-progress: false   # never overlap, never kill a run mid-write
+
+permissions:
+  contents: read
+  id-token: write   # OIDC token for keyless GCP auth (Workload Identity Federation)
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: Install
+        run: uv sync --frozen --no-dev
+
+      - name: Ingest
+        run: uv run --no-sync python -m flows.ingest
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          EIA_API_KEY: ${{ secrets.EIA_API_KEY }}

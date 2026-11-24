@@ -1,25 +1,30 @@
 """
-EarthOS Prefect flows — one flow per source, plus a metrics flow.
+EarthOS hourly ingest — plain Python, scheduled by GitHub Actions
+(.github/workflows/ingest.yml).
 
-Schedules:
-  EIA:     hourly         (data publishes ~1hr behind real-time)
-  USGS:    every 10 min   (automatic detections arrive fast)
-  NDBC:    every 10 min   (buoys report on ~10min interval)
-  NWS:     hourly
-  NHC:     every 3 hrs    (advisory cycle)
-  Metrics: hourly, after sources complete
+    uv run python -m flows.ingest
+
+1. Fetch + normalize every source (each re-reads the shared lookback window)
+2. One BigQuery MERGE for all source events
+3. Compute derived metrics from BigQuery
+4. One BigQuery MERGE for all metric events
+
+A failing source or metric is logged and reported; the rest still land.
+Exits 1 if anything failed, so the Actions run shows red.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-from prefect import flow, task, get_run_logger
-from prefect.schedules import Cron
+import logging
+import sys
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Callable, Dict, List
 
 from apps.bigquery.db import init_table, upsert_events
 from metrics.demand_anomaly import compute_demand_anomaly
 from metrics.heat_stress import compute_heat_stress
 from metrics.seismic_proximity import compute_seismic_proximity
+from models.event import EarthEvent
 from sources.eia.client import fetch_demand
 from sources.eia.normalize import normalize_rows as normalize_eia
 from sources.noaa.ndbc.client import fetch_all_priority_stations
@@ -31,127 +36,120 @@ from sources.noaa.weather.normalize import normalize_all as normalize_nws
 from sources.usgs.client import fetch_earthquakes
 from sources.usgs.normalize import normalize_features as normalize_usgs
 
+log = logging.getLogger("earthos.ingest")
+
+Fetcher = Callable[[], List[EarthEvent]]
+
 EIA_RESPONDENTS = ["ERCO", "CISO", "PJM", "MISO", "ISNE"]
 
-# ── Tasks ────────────────────────────────────────────────────────────────────
 
-@task(retries=3, retry_delay_seconds=30, name="ingest-eia-ba")
-def ingest_eia_ba(ba: str, length: int = 100) -> int:
-    logger = get_run_logger()
-    rows = fetch_demand(ba, length=length)
-    events = normalize_eia(rows)
-    count = upsert_events(events)
-    logger.info(f"EIA {ba}: {count} events upserted")
-    return count
+# ── Sources: fetch + normalize, no writes ────────────────────────────────────
+
+def fetch_eia_ba(ba: str) -> List[EarthEvent]:
+    return normalize_eia(fetch_demand(ba, length=100))
 
 
-@task(retries=3, retry_delay_seconds=30, name="ingest-usgs")
-def ingest_usgs_task(min_magnitude: float = 2.5, limit: int = 1000) -> int:
-    logger = get_run_logger()
-    features = fetch_earthquakes(min_magnitude=min_magnitude, limit=limit)
-    events = normalize_usgs(features)
-    count = upsert_events(events)
-    logger.info(f"USGS: {count} events upserted")
-    return count
+def fetch_usgs() -> List[EarthEvent]:
+    return normalize_usgs(fetch_earthquakes(min_magnitude=2.5, limit=1000))
 
 
-@task(retries=3, retry_delay_seconds=30, name="ingest-ndbc")
-def ingest_ndbc_task() -> int:
-    logger = get_run_logger()
-    station_texts = fetch_all_priority_stations()
-    events = normalize_ndbc(station_texts)
-    count = upsert_events(events)
-    logger.info(f"NDBC: {count} events upserted ({len(station_texts)} stations)")
-    return count
+def fetch_ndbc() -> List[EarthEvent]:
+    return normalize_ndbc(fetch_all_priority_stations())
 
 
-@task(retries=2, retry_delay_seconds=60, name="ingest-nhc")
-def ingest_nhc_task() -> int:
-    logger = get_run_logger()
-    storms = fetch_active_storms()
-    events = normalize_nhc(storms)
-    count = upsert_events(events)
-    logger.info(f"NHC: {count} events upserted ({len(storms)} active storms)")
-    return count
+def fetch_nhc() -> List[EarthEvent]:
+    return normalize_nhc(fetch_active_storms())
 
 
-@task(retries=3, retry_delay_seconds=30, name="ingest-nws")
-def ingest_nws_task() -> int:
-    logger = get_run_logger()
-    observations = fetch_all_ba_observations()
-    events = normalize_nws(observations, BA_CENTROIDS)
-    count = upsert_events(events)
-    logger.info(f"NWS: {count} events upserted ({len(observations)} BAs)")
-    return count
+def fetch_nws() -> List[EarthEvent]:
+    return normalize_nws(fetch_all_ba_observations(), BA_CENTROIDS)
 
 
-@task(retries=2, retry_delay_seconds=60, name="compute-metrics")
-def compute_metrics_task() -> int:
-    logger = get_run_logger()
-    total = 0
-    for label, fn in [
-        ("seismic_proximity", compute_seismic_proximity),
-        ("demand_anomaly",    compute_demand_anomaly),
-        ("heat_stress",       compute_heat_stress),
-    ]:
-        events = fn()
-        count = upsert_events(events)
-        logger.info(f"{label}: {count} derived events")
-        total += count
-    return total
+# One entry per BA for EIA, so one BA's outage doesn't drop the other four
+SOURCES: Dict[str, Fetcher] = {
+    **{f"EIA-{ba}": partial(fetch_eia_ba, ba) for ba in EIA_RESPONDENTS},
+    "USGS": fetch_usgs,
+    "NDBC": fetch_ndbc,
+    "NHC":  fetch_nhc,
+    "NWS":  fetch_nws,
+}
+
+METRICS: Dict[str, Fetcher] = {
+    "seismic_proximity": compute_seismic_proximity,
+    "demand_anomaly":    compute_demand_anomaly,
+    "heat_stress":       compute_heat_stress,
+}
 
 
-# ── Flows ────────────────────────────────────────────────────────────────────
+# ── Runner ───────────────────────────────────────────────────────────────────
 
-@flow(name="earthos-eia", log_prints=True)
-def eia_flow():
-    init_table()
-    for ba in EIA_RESPONDENTS:
-        ingest_eia_ba(ba)
+@dataclass
+class RunResult:
+    counts: Dict[str, int] = field(default_factory=dict)
+    failed: List[str] = field(default_factory=list)
 
-
-@flow(name="earthos-usgs", log_prints=True)
-def usgs_flow():
-    init_table()
-    ingest_usgs_task()
+    @property
+    def ok(self) -> bool:
+        return not self.failed
 
 
-@flow(name="earthos-ndbc", log_prints=True)
-def ndbc_flow():
-    init_table()
-    ingest_ndbc_task()
+def collect(fetchers: Dict[str, Fetcher], result: RunResult) -> List[EarthEvent]:
+    """Call every fetcher; log and record failures instead of raising."""
+    events: List[EarthEvent] = []
+    for name, fetch in fetchers.items():
+        try:
+            batch = fetch()
+        except Exception:
+            log.exception("%s failed", name)
+            result.failed.append(name)
+            continue
+        result.counts[name] = len(batch)
+        log.info("%s: %d events", name, len(batch))
+        events.extend(batch)
+    return events
 
 
-@flow(name="earthos-nhc", log_prints=True)
-def nhc_flow():
-    init_table()
-    ingest_nhc_task()
+def run_hourly(
+    sources: Dict[str, Fetcher] = SOURCES,
+    metrics: Dict[str, Fetcher] = METRICS,
+    upsert: Callable[[List[EarthEvent]], int] = upsert_events,
+    init: Callable[[], None] = init_table,
+) -> RunResult:
+    """
+    Sources -> one upsert -> metrics -> one upsert.
+    Metrics run after the source upsert because they read from BigQuery.
+    Upsert errors propagate: if the write fails, the run has failed.
+    """
+    result = RunResult()
+    init()
+
+    source_events = collect(sources, result)
+    if source_events:
+        upsert(source_events)
+
+    metric_events = collect(metrics, result)
+    if metric_events:
+        upsert(metric_events)
+
+    return result
 
 
-@flow(name="earthos-nws", log_prints=True)
-def nws_flow():
-    init_table()
-    ingest_nws_task()
-
-
-@flow(name="earthos-metrics", log_prints=True)
-def metrics_flow():
-    """Derived metrics — runs after source flows complete."""
-    compute_metrics_task()
-
-
-@flow(name="earthos-all", log_prints=True)
-def all_sources_flow():
-    """Run all sources sequentially then compute metrics. For manual full runs."""
-    init_table()
-    for ba in EIA_RESPONDENTS:
-        ingest_eia_ba(ba)
-    ingest_usgs_task()
-    ingest_ndbc_task()
-    ingest_nhc_task()
-    ingest_nws_task()
-    compute_metrics_task()
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    # httpx logs every request URL at INFO, and EIA's URL carries api_key.
+    # Actions logs are public on this repo, so keep request URLs out of them.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    result = run_hourly()
+    total = sum(result.counts.values())
+    if result.ok:
+        log.info("done: %d events, all sources and metrics succeeded", total)
+        return 0
+    log.error("done: %d events, FAILED: %s", total, ", ".join(result.failed))
+    return 1
 
 
 if __name__ == "__main__":
-    all_sources_flow()
+    sys.exit(main())
