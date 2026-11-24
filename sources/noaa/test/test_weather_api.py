@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 BASE_URL = "https://api.weather.gov"
-HEADERS = {"User-Agent": "EarthOS/0.2 (https://github.com/hannahvu/earth-os)"}
+HEADERS = {"User-Agent": "EarthOS/0.3 (https://github.com/hannahvu/earth-os)"}
 
 # BA centroids — we want weather observations near each grid region
 BA_CENTROIDS = {
