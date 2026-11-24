@@ -139,6 +139,32 @@ def build_events_query(
     return sql, params
 
 
+def build_watermark_sql(table: str) -> str:
+    """Newest observed_at per (source, region) since @since (partition-pruned)."""
+    return f"""
+        SELECT source, region, MAX(observed_at) AS latest
+        FROM `{table}`
+        WHERE observed_at >= @since
+        GROUP BY source, region
+    """
+
+
+Watermarks = Dict[Tuple[str, Optional[str]], datetime]
+
+
+def fold_watermarks(rows: List[Tuple[str, str, datetime]]) -> Watermarks:
+    """
+    (source, region, latest) rows -> {(source, region): latest}, plus
+    source-level maxima under (source, None).
+    """
+    marks: Watermarks = {}
+    for source, region, latest in rows:
+        marks[(source, region)] = latest
+        if (source, None) not in marks or latest > marks[(source, None)]:
+            marks[(source, None)] = latest
+    return marks
+
+
 # ── I/O ──────────────────────────────────────────────────────────────────────
 
 def upsert_events(events: List[EarthEvent], table: str = FULL_TABLE) -> int:
@@ -194,3 +220,13 @@ def get_events(
     job_config = bigquery.QueryJobConfig(query_parameters=params)
     rows = client.query(sql, job_config=job_config).result()
     return [EarthEvent(**dict(r)) for r in rows]
+
+
+def get_watermarks(since: datetime, table: str = FULL_TABLE) -> Watermarks:
+    """Newest stored observed_at per (source, region) and per source, since `since`."""
+    client = get_client()
+    job_config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("since", "TIMESTAMP", since),
+    ])
+    rows = client.query(build_watermark_sql(table), job_config=job_config).result()
+    return fold_watermarks([(r.source, r.region, r.latest) for r in rows])

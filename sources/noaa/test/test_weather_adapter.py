@@ -232,3 +232,80 @@ def test_full_pipeline():
     assert sources == {"NWS"}
     assert "air_temperature" in event_types
     assert all(isinstance(e, EarthEvent) for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Pagination — unit, fake _get
+# ---------------------------------------------------------------------------
+
+def _page(timestamps, next_url=None) -> dict:
+    return {
+        "features": [{"properties": {"timestamp": ts, "temperature": {"value": 20.0}}} for ts in timestamps],
+        "pagination": {"next": next_url} if next_url else {},
+    }
+
+
+def _fake_pages(monkeypatch, pages):
+    """Serve pages in order for observation URLs; station lookup is pre-cached."""
+    served = []
+
+    def fake_get(url):
+        served.append(url)
+        return pages[len(served) - 1]
+
+    monkeypatch.setattr(nws_client, "_get", fake_get)
+    monkeypatch.setattr(nws_client, "_station_cache", {BA_CENTROIDS["ERCO"]: "KTEST"})
+    return served
+
+
+START = datetime(2026, 11, 24, 0, 0, tzinfo=timezone.utc)
+
+
+def test_pagination_stops_when_page_reaches_start(monkeypatch):
+    served = _fake_pages(monkeypatch, [
+        _page(["2026-11-24T10:00:00+00:00", "2026-11-24T05:00:00+00:00"], next_url="https://n/2"),
+        _page(["2026-11-24T02:00:00+00:00", "2026-11-23T20:00:00+00:00"], next_url="https://n/3"),
+        _page(["2026-11-20T00:00:00+00:00"]),  # must never be fetched
+    ])
+    station, obs = nws_client.fetch_observations("ERCO", START)
+    assert len(served) == 2
+    assert station == "KTEST"
+    # 23T20:00 is older than start and is dropped
+    assert [o.properties.timestamp for o in obs] == [
+        "2026-11-24T10:00:00+00:00", "2026-11-24T05:00:00+00:00", "2026-11-24T02:00:00+00:00",
+    ]
+
+
+def test_pagination_stops_without_next(monkeypatch):
+    served = _fake_pages(monkeypatch, [_page(["2026-11-24T10:00:00+00:00"])])
+    _, obs = nws_client.fetch_observations("ERCO", START)
+    assert len(served) == 1 and len(obs) == 1
+
+
+def test_pagination_stops_on_empty_page(monkeypatch):
+    served = _fake_pages(monkeypatch, [
+        _page(["2026-11-24T10:00:00+00:00"], next_url="https://n/2"),
+        _page([], next_url="https://n/3"),
+    ])
+    nws_client.fetch_observations("ERCO", START)
+    assert len(served) == 2
+
+
+def test_pagination_capped(monkeypatch):
+    pages = [_page(["2026-11-24T10:00:00+00:00"], next_url=f"https://n/{i}") for i in range(nws_client.MAX_PAGES + 5)]
+    served = _fake_pages(monkeypatch, pages)
+    nws_client.fetch_observations("ERCO", START)
+    assert len(served) == nws_client.MAX_PAGES
+
+
+def test_live_multi_day_range_paginates():
+    """3 days at ~5-min reporting spans more than one 500-observation page."""
+    from datetime import timedelta
+    start = datetime.now(tz=timezone.utc) - timedelta(days=3)
+    result = nws_client.fetch_observations("ERCO", start)
+    assert result is not None
+    _, obs = result
+    times = [datetime.fromisoformat(o.properties.timestamp) for o in obs]
+    print(f"\n=== ERCO: {len(obs)} observations over 3 days, oldest {min(times)} ===")
+    assert min(times) >= start
+    assert min(times) < start + timedelta(hours=6)  # reached back to the start of the window

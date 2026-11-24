@@ -6,13 +6,13 @@ Run via PyCharm run button or:
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List
 
 import pytest
 
 import flows.ingest as ingest
-from flows.ingest import RunResult, collect, run_hourly
+from flows.ingest import RunResult, Source, collect, eia_start, parse_since, run_hourly, source_cutoffs
 from models.event import EarthEvent
 
 NOW = datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc)
@@ -54,12 +54,19 @@ def _run(sources, metrics):
         return wrapper
 
     result = run_hourly(
-        sources={k: tracked(k, v) for k, v in sources.items()},
+        sources={k: _src(tracked(k, v)) for k, v in sources.items()},
         metrics={k: tracked(k, v) for k, v in metrics.items()},
         upsert=upsert,
         init=lambda: None,
+        watermarks=lambda since: {},
+        now=NOW,
     )
     return result, upsert, log
+
+
+def _src(fn, key=("TEST", None), min_lookback=timedelta(hours=6)) -> Source:
+    """Wrap a zero-arg fake as a Source whose fetch ignores the cutoff."""
+    return Source(fetch=lambda cutoff: fn(), key=key, min_lookback=min_lookback)
 
 
 def test_failing_source_does_not_block_others():
@@ -103,7 +110,8 @@ def test_upsert_failure_propagates():
         raise RuntimeError("BigQuery down")
 
     with pytest.raises(RuntimeError):
-        run_hourly(sources={"A": lambda: [_event("a1")]}, metrics={}, upsert=bad_upsert, init=lambda: None)
+        run_hourly(sources={"A": _src(lambda: [_event("a1")])}, metrics={}, upsert=bad_upsert,
+                   init=lambda: None, watermarks=lambda since: {}, now=NOW)
 
 
 def test_collect_records_failures():
@@ -115,8 +123,8 @@ def test_collect_records_failures():
 
 @pytest.mark.parametrize("failed, code", [([], 0), (["NWS"], 1)])
 def test_main_exit_code(monkeypatch, failed, code):
-    monkeypatch.setattr(ingest, "run_hourly", lambda: RunResult(counts={"A": 1}, failed=failed))
-    assert ingest.main() == code
+    monkeypatch.setattr(ingest, "run_hourly", lambda **kw: RunResult(counts={"A": 1}, failed=failed))
+    assert ingest.main([]) == code
 
 
 def test_sources_cover_every_adapter():
@@ -127,6 +135,79 @@ def test_sources_cover_every_adapter():
 def test_main_silences_httpx_request_logs(monkeypatch):
     """EIA's request URL contains api_key; httpx must not log it in public Actions logs."""
     import logging
-    monkeypatch.setattr(ingest, "run_hourly", lambda: RunResult())
-    ingest.main()
+    monkeypatch.setattr(ingest, "run_hourly", lambda **kw: RunResult())
+    ingest.main([])
     assert logging.getLogger("httpx").getEffectiveLevel() >= logging.WARNING
+
+
+
+# ---------------------------------------------------------------------------
+# Cutoffs from watermarks
+# ---------------------------------------------------------------------------
+
+def _recording_sources(seen: dict) -> dict:
+    def fetch_for(name):
+        def fetch(cutoff):
+            seen[name] = cutoff
+            return []
+        return fetch
+    return {
+        "EIA-ERCO": Source(fetch_for("EIA-ERCO"), key=("EIA", "ERCO"), min_lookback=timedelta(hours=100)),
+        "NDBC": Source(fetch_for("NDBC"), key=("NDBC", None)),
+        "NWS": Source(fetch_for("NWS"), key=("NWS", None)),
+    }
+
+
+def test_each_fetch_receives_its_cutoff():
+    seen: dict = {}
+    marks = {
+        ("EIA", "ERCO"): NOW - timedelta(hours=1),   # fresh -> min lookback (100 h)
+        ("NDBC", None): NOW - timedelta(hours=20),   # gap -> watermark - 1 h
+        # NWS missing -> 7-day floor
+    }
+    run_hourly(sources=_recording_sources(seen), metrics={}, upsert=lambda e: 0,
+               init=lambda: None, watermarks=lambda since: marks, now=NOW)
+    assert seen["EIA-ERCO"] == NOW - timedelta(hours=100)
+    assert seen["NDBC"] == NOW - timedelta(hours=21)
+    assert seen["NWS"] == NOW - timedelta(days=7)
+
+
+def test_watermarks_queried_over_max_lookback():
+    asked = []
+    run_hourly(sources={}, metrics={}, upsert=lambda e: 0, init=lambda: None,
+               watermarks=lambda since: asked.append(since) or {}, now=NOW)
+    assert asked == [NOW - timedelta(days=7)]
+
+
+def test_since_forces_cutoffs_back_but_never_forward():
+    seen: dict = {}
+    marks = {("EIA", "ERCO"): NOW, ("NDBC", None): NOW, ("NWS", None): NOW}
+    since = NOW - timedelta(hours=30)
+    run_hourly(sources=_recording_sources(seen), metrics={}, upsert=lambda e: 0, init=lambda: None,
+               watermarks=lambda s: marks, now=NOW, since=since)
+    assert seen["NDBC"] == since and seen["NWS"] == since
+    assert seen["EIA-ERCO"] == NOW - timedelta(hours=100)  # already further back than since
+
+
+def test_source_cutoffs_by_key():
+    sources = _recording_sources({})
+    # 5 days is past EIA's 100 h minimum, so the watermark (minus 1 h overlap) wins
+    cutoffs = source_cutoffs(sources, {("EIA", "ERCO"): NOW - timedelta(days=5)}, NOW)
+    assert cutoffs["EIA-ERCO"] == NOW - timedelta(days=5, hours=1)
+
+
+def test_eia_start_format():
+    assert eia_start(datetime(2026, 11, 24, 3, 40, tzinfo=timezone.utc)) == "2026-11-24T03"
+    assert eia_start(datetime(2026, 11, 23, 21, 40, tzinfo=timezone(timedelta(hours=-6)))) == "2026-11-24T03"
+
+
+@pytest.mark.parametrize("value", ["2026-11-24T00:00Z", "2026-11-24T00:00:00+00:00", "2026-11-24T00:00"])
+def test_parse_since_is_utc(value):
+    assert parse_since(value) == datetime(2026, 11, 24, tzinfo=timezone.utc)
+
+
+def test_sources_have_expected_watermark_keys():
+    assert ingest.SOURCES["EIA-ERCO"].key == ("EIA", "ERCO")
+    assert ingest.SOURCES["EIA-ERCO"].min_lookback == timedelta(hours=100)
+    assert ingest.SOURCES["NDBC"].key == ("NDBC", None)
+    assert ingest.SOURCES["NWS"].key == ("NWS", None)

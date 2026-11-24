@@ -190,3 +190,37 @@ def test_staging_tables_cleaned_up(test_table):
     prefix = test_table.split(".")[-1] + "_staging_"
     leftovers = [t.table_id for t in get_client().list_tables(DATASET) if t.table_id.startswith(prefix)]
     assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# Watermarks
+# ---------------------------------------------------------------------------
+
+from apps.bigquery.db import build_watermark_sql, fold_watermarks, get_watermarks  # noqa: E402
+
+
+def test_watermark_sql_is_partition_pruned_and_grouped():
+    sql = build_watermark_sql("p.d.events")
+    assert "observed_at >= @since" in sql
+    assert "GROUP BY source, region" in sql
+
+
+def test_fold_watermarks_adds_source_level_max():
+    t1, t2, t3 = NOW - timedelta(hours=3), NOW - timedelta(hours=1), NOW - timedelta(hours=2)
+    marks = fold_watermarks([("EIA", "ERCO", t1), ("EIA", "CISO", t2), ("NDBC", "Buoy A", t3)])
+    assert marks[("EIA", "ERCO")] == t1
+    assert marks[("EIA", None)] == t2
+    assert marks[("NDBC", None)] == t3
+
+
+def test_fold_watermarks_empty():
+    assert fold_watermarks([]) == {}
+
+
+@live
+def test_get_watermarks_live(test_table):
+    upsert_events([_event("w1", observed_at=NOW - timedelta(hours=2), region="A"),
+                   _event("w2", observed_at=NOW - timedelta(hours=1), region="B")], table=test_table)
+    marks = get_watermarks(NOW - timedelta(days=1), table=test_table)
+    assert marks[("USGS", "A")] == NOW - timedelta(hours=2)
+    assert marks[("USGS", None)] == NOW - timedelta(hours=1)

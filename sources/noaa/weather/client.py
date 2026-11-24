@@ -15,6 +15,7 @@ from sources.noaa.weather.schema import (
 )
 
 BASE_URL = "https://api.weather.gov"
+MAX_PAGES = 10  # 500 observations per page; 7 days at 5-min reporting is ~2 pages
 MAX_RETRIES = 3
 RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 
@@ -53,6 +54,29 @@ def observations_url(station_id: str, start: datetime) -> str:
     """Observations endpoint for a time range. `start` is sent as UTC with a Z suffix."""
     iso = start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     return f"{BASE_URL}/stations/{station_id}/observations?start={iso}"
+
+
+def _obs_time(obs: NWSObservation) -> Optional[datetime]:
+    ts = obs.properties.timestamp
+    try:
+        return datetime.fromisoformat(ts).astimezone(timezone.utc) if ts else None
+    except ValueError:
+        return None
+
+
+def observations_since(obs_list: List[NWSObservation], start: datetime) -> List[NWSObservation]:
+    """Keep observations at or after `start` (pagination can run past it)."""
+    return [o for o in obs_list if (t := _obs_time(o)) is not None and t >= start]
+
+
+def page_reaches_start(page: List[NWSObservation], start: datetime) -> bool:
+    """
+    True once a page (newest first) includes anything older than `start`.
+    The `next` cursor ignores `start` and keeps going into older data,
+    so this is the stop condition.
+    """
+    times = [t for o in page if (t := _obs_time(o)) is not None]
+    return bool(times) and min(times) < start
 
 
 def _nearest_station_id(lat: float, lon: float) -> Optional[str]:
@@ -105,11 +129,19 @@ def fetch_observations(ba: str, start: datetime) -> Optional[Tuple[str, List[NWS
     if not station_id:
         return None
 
+    observations: List[NWSObservation] = []
+    url: Optional[str] = observations_url(station_id, start)
     try:
-        data = _get(observations_url(station_id, start))
-        return station_id, NWSObservationCollection.model_validate(data).features
+        for _ in range(MAX_PAGES):
+            data = _get(url)
+            page = NWSObservationCollection.model_validate(data).features
+            observations.extend(page)
+            url = (data.get("pagination") or {}).get("next")
+            if not page or not url or page_reaches_start(page, start):
+                break
     except Exception:
         return None
+    return station_id, observations_since(observations, start)
 
 
 def fetch_all_ba_observations(
