@@ -96,9 +96,10 @@ def get_events(
     db_path: str,
     region: Optional[str] = None,
     event_type: Optional[str] = None,
+    source: Optional[str] = None,
     limit: int = 500,
 ) -> List[EarthEvent]:
-    """Query events, optionally filtered by region and/or event_type, ordered by observed_at desc."""
+    """Query events, optionally filtered by region, event_type, and/or source, ordered by observed_at desc."""
     filters = []
     params: list = []
 
@@ -108,6 +109,9 @@ def get_events(
     if event_type:
         filters.append("event_type = ?")
         params.append(event_type)
+    if source:
+        filters.append("source = ?")
+        params.append(source)
 
     query = "SELECT * FROM events"
     if filters:

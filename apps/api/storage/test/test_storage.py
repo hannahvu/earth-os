@@ -98,6 +98,24 @@ def test_get_events_filter_by_region(tmp_path):
     assert results[0].region == "CISO"
 
 
+def test_get_events_filter_by_source(tmp_path):
+    db = str(tmp_path / "test.db")
+    init_db(db)
+
+    eia = _make_event("eia-erco-2026-08-08t10-d", region="ERCO")
+    usgs = _make_event("usgs-abc123", region="California")
+    usgs = usgs.model_copy(update={"source": "USGS", "event_type": "earthquake"})
+    upsert_events([eia, usgs], db)
+
+    results = get_events(db, source="USGS")
+    assert len(results) == 1
+    assert results[0].source == "USGS"
+
+    results = get_events(db, source="EIA")
+    assert len(results) == 1
+    assert results[0].source == "EIA"
+
+
 def test_get_events_respects_limit(tmp_path):
     db = str(tmp_path / "test.db")
     init_db(db)
