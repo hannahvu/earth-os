@@ -1,0 +1,46 @@
+# CI/CD for the EarthOS ingest job. Cloud Build trigger `deploy-ingest`
+# runs this on every push to main: build the image, push it to Artifact
+# Registry, and point the Cloud Run Job at it.
+substitutions:
+  _REGION: us-central1
+  _JOB: earthos-ingest
+  _IMAGE: us-central1-docker.pkg.dev/earth-os-511902/earthos/ingest
+  _RUNTIME_SA: earthos-ingest@earth-os-511902.iam.gserviceaccount.com
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}:${COMMIT_SHA}", "."]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "${_IMAGE}:${COMMIT_SHA}"]
+
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - jobs
+      - deploy
+      - ${_JOB}
+      - --project=${PROJECT_ID}
+      - --region=${_REGION}
+      - --image=${_IMAGE}:${COMMIT_SHA}
+      - --service-account=${_RUNTIME_SA}
+      - --set-env-vars=GCP_PROJECT=${PROJECT_ID}
+      - --set-secrets=EIA_API_KEY=eia-api-key:latest
+      - --cpu=1
+      - --memory=2Gi
+      - --task-timeout=20m
+      - --max-retries=1
+      - --tasks=1
+
+images:
+  - ${_IMAGE}:${COMMIT_SHA}
+
+options:
+  # Required when the build runs as a user-specified service account
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 1200s
